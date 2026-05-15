@@ -1,186 +1,119 @@
 "use client";
-
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Room, RoomEvent, Track } from "livekit-client";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import {
-  Baby,
-  BarChart3,
-  Brain,
-  CalendarClock,
-  Hospital,
-  Loader2,
-  MessageSquare,
-  Mic,
-  PhoneOff,
-  Send,
-  Settings,
-  ShieldCheck,
-  X
-} from "lucide-react";
+import { BarChart3, Brain, PhoneOff, Mic, Loader2, X, CheckCircle2, AlertTriangle, User, Calendar, Shield, Navigation } from "lucide-react";
+import { TurnResponse, SessionSummary, startSession, postVoiceTurn, fetchSessionSummary } from "@/lib/api";
 
-import {
-  TurnResponse,
-  createCitizen,
-  createLiveKitToken,
-  postTextTurn,
-  postVoiceTurn,
-  startSession
-} from "@/lib/api";
+// ── Constants ──────────────────────────────────────────────
+const SILENCE_MS = 700;
+const MIN_SPEECH_MS = 300;
+const MAX_TURN_MS = 15000;
+const NO_SPEECH_ROLLOVER_MS = 25000;
+const VOICE_THRESHOLD = 0.02;
 
-// ── Types ──────────────────────────────────────────────────
-type AppState = "idle" | "connecting" | "speaking-intro" | "listening" | "thinking" | "speaking";
+type AppState = "idle" | "listening-wake" | "connecting" | "speaking-intro" | "awaiting-id" | "verifying" | "listening" | "thinking" | "speaking" | "ended";
 
-type SpeechState = {
-  hasSpeech: boolean;
-  lastVoiceAt: number;
-  startedAt: number;
-  stopped: boolean;
-  discard: boolean;
+type SpeechState = { hasSpeech: boolean; lastVoiceAt: number; startedAt: number; stopped: boolean; discard: boolean };
+
+type ChatEntry = { role: "agent" | "user"; text: string; intent?: string; timestamp: number };
+
+type CitizenInfo = {
+  full_name?: string;
+  phc_name?: string;
+  ayushman_eligible?: boolean;
 };
 
-type ChatEntry = {
-  role: "agent" | "user";
-  text: string;
-  intent?: string;
-};
-
-// ── Quick prompts ──────────────────────────────────────────
-const quickPrompts = [
-  { icon: Hospital,     label: "PHC counter",  text: "Where is the registration counter?" },
-  { icon: ShieldCheck,  label: "Eligibility",  text: "Am I eligible for Ayushman Bharat or CMCHIS?" },
-  { icon: CalendarClock,label: "Appointment",  text: "Book a doctor appointment for tomorrow morning." },
-  { icon: Baby,         label: "ANC reminder", text: "Set my maternal health reminder for ANC visit." }
-];
-
-// ── VAD constants ──────────────────────────────────────────
-const SILENCE_MS            = 650;
-const MIN_SPEECH_MS         = 250;
-const MAX_TURN_MS           = 14000;
-const NO_SPEECH_ROLLOVER_MS = 30000;
-const VOICE_THRESHOLD       = 0.022;
-
-// ── Codec probe ────────────────────────────────────────────
-function getSupportedMimeType(): string {
-  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
-  for (const type of candidates) {
-    if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type)) return type;
+function getSupportedMimeType() {
+  for (const t of ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"]) {
+    if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(t)) return t;
   }
   return "";
 }
 
-// ── State → orb visual config ──────────────────────────────
-function orbConfig(state: AppState, voiceLevel: number) {
-  const scale = 1 + Math.min(voiceLevel * 8, 0.45);
-  const ringOpacity = Math.min(0.15 + voiceLevel * 6, 0.8);
+// Wake words across languages
+const WAKE_WORDS = [
+  { words: ["vanakkam", "one come", "வணக்கம்"], lang: "ta-IN" },
+  { words: ["namaskara", "ನಮಸ್ಕಾರ", "namaskaar"], lang: "kn-IN" },
+  { words: ["namaste", "namaskar", "नमस्ते", "नमस्कार"], lang: "hi-IN" },
+  { words: ["hello", "hi", "hey", "good morning", "good afternoon"], lang: "en-IN" },
+];
 
+function detectWakeWord(transcript: string): string | null {
+  const lower = transcript.toLowerCase();
+  for (const group of WAKE_WORDS) {
+    if (group.words.some(w => lower.includes(w))) return group.lang;
+  }
+  return null;
+}
+
+function orbStyle(state: AppState, level: number) {
+  const scale = 1 + Math.min(level * 8, 0.5);
   switch (state) {
-    case "listening":
-      return {
-        bg: "radial-gradient(circle at 38% 30%, #2a8f62 0%, #155038 45%, #072418 100%)",
-        ambient: "#3ddc97",
-        ring: `rgba(61,220,151,${ringOpacity})`,
-        scale,
-        haloBorder: "rgba(61,220,151,0.2)",
-        dotColor: "#3ddc97",
-        label: "Listening",
-      };
-    case "thinking":
-      return {
-        bg: "radial-gradient(circle at 38% 30%, #1a4a7a 0%, #0d2d54 45%, #060f1f 100%)",
-        ambient: "#5b9cf6",
-        ring: "rgba(91,156,246,0.3)",
-        scale: 1,
-        haloBorder: "rgba(91,156,246,0.2)",
-        dotColor: "#5b9cf6",
-        label: "Thinking",
-      };
-    case "speaking":
-    case "speaking-intro":
-      return {
-        bg: "radial-gradient(circle at 38% 30%, #6e3ddc 0%, #3d1a8a 45%, #140a2e 100%)",
-        ambient: "#a06ef5",
-        ring: "rgba(160,110,245,0.35)",
-        scale: 1.04 + Math.sin(Date.now() / 300) * 0.02,
-        haloBorder: "rgba(160,110,245,0.2)",
-        dotColor: "#a06ef5",
-        label: "Speaking",
-      };
+    case "listening": case "awaiting-id":
+      return { grad: "radial-gradient(circle at 38% 30%, #1a6b45 0%, #0d3d26 50%, #061a10 100%)", glow: "#3ddc97", ring: `rgba(61,220,151,${0.15 + level * 5})`, scale, label: state === "awaiting-id" ? "Say your ID…" : "Listening" };
+    case "thinking": case "verifying":
+      return { grad: "radial-gradient(circle at 38% 30%, #1a3a7a 0%, #0d2050 50%, #06091e 100%)", glow: "#5b9cf6", ring: "rgba(91,156,246,0.3)", scale: 1, label: state === "verifying" ? "Verifying…" : "Thinking…" };
+    case "speaking": case "speaking-intro":
+      return { grad: "radial-gradient(circle at 38% 30%, #5a1a9a 0%, #32076a 50%, #110024 100%)", glow: "#a06ef5", ring: "rgba(160,110,245,0.35)", scale: 1.04, label: "Speaking" };
     case "connecting":
-      return {
-        bg: "radial-gradient(circle at 38% 30%, #1e6e4c 0%, #0d3d2b 45%, #061a14 100%)",
-        ambient: "#3ddc97",
-        ring: "rgba(61,220,151,0.15)",
-        scale: 1,
-        haloBorder: "rgba(61,220,151,0.1)",
-        dotColor: "#f4c154",
-        label: "Connecting",
-      };
+      return { grad: "radial-gradient(circle at 38% 30%, #1e3a4c 0%, #0d1e2b 50%, #040c14 100%)", glow: "#5b9cf6", ring: "rgba(91,156,246,0.2)", scale: 1, label: "Connecting…" };
+    case "ended":
+      return { grad: "radial-gradient(circle at 38% 30%, #2a1010 0%, #1a0808 50%, #0a0303 100%)", glow: "#ff6b4a", ring: "rgba(255,107,74,0.2)", scale: 1, label: "Call ended" };
+    case "listening-wake":
+      return { grad: "radial-gradient(circle at 38% 30%, #0d2a1c 0%, #071510 50%, #030a06 100%)", glow: "#1f6e4c", ring: "rgba(61,220,151,0.08)", scale: 1, label: 'Say "Hello" to begin' };
     default:
-      return {
-        bg: "radial-gradient(circle at 38% 30%, #1e6e4c 0%, #0d3d2b 45%, #061a14 100%)",
-        ambient: "#1f6e4c",
-        ring: "rgba(61,220,151,0.12)",
-        scale: 1,
-        haloBorder: "rgba(61,220,151,0.08)",
-        dotColor: "#3ddc97",
-        label: "Tap to start",
-      };
+      return { grad: "radial-gradient(circle at 38% 30%, #0d2a1c 0%, #071510 50%, #030a06 100%)", glow: "#1f6e4c", ring: "rgba(61,220,151,0.06)", scale: 1, label: 'Say "Hello" to begin' };
   }
 }
 
-// ── Component ──────────────────────────────────────────────
+const INTENT_ICONS: Record<string, typeof CheckCircle2> = {
+  verify_identity: User,
+  appointment_booking: Calendar,
+  eligibility_check: Shield,
+  hospital_navigation: Navigation,
+  emergency: AlertTriangle,
+  session_end: CheckCircle2,
+};
+
 export function VoiceConsole() {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
-  // Citizen settings
-  const [phoneNumber, setPhoneNumber] = useState("9000001001");
-  const [fullName,    setFullName]    = useState("Meena Ravi");
-  const [languageCode,setLanguageCode]= useState("ta-IN");
-  const [district,    setDistrict]    = useState("Chennai");
-  const [phcName,     setPhcName]     = useState("T Nagar Urban Primary Health Centre");
-  const [text,        setText]        = useState("");
+  const [appState, setAppState] = useState<AppState>("idle");
+  const [voiceLevel, setVoiceLevel] = useState(0);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [chat, setChat] = useState<ChatEntry[]>([]);
+  const [latestText, setLatestText] = useState("");
+  const [latestIntent, setLatestIntent] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [citizen, setCitizen] = useState<CitizenInfo | null>(null);
+  const [verificationState, setVerificationState] = useState<"pending" | "verified" | "guest">("pending");
+  const [summary, setSummary] = useState<SessionSummary | null>(null);
+  const [tick, setTick] = useState(0);
 
-  // App state machine
-  const [appState,          setAppState]          = useState<AppState>("idle");
-  const [error,             setError]             = useState<string | null>(null);
-  const [voiceLevel,        setVoiceLevel]        = useState(0);
-  const [sessionId,         setSessionId]         = useState<string | null>(null);
-  const [chatHistory,       setChatHistory]       = useState<ChatEntry[]>([]);
-  const [latestAgentText,   setLatestAgentText]   = useState<string>("");
-  const [latestAgentIntent, setLatestAgentIntent] = useState<string>("");
-  const [showChat,          setShowChat]          = useState(false);
-  const [showSettings,      setShowSettings]      = useState(false);
-  const [turn,              setTurn]              = useState<TurnResponse | null>(null);
+  const roomRef = useRef<any>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const animRef = useRef<number | null>(null);
+  const levelAnimRef = useRef<number | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const speechStateRef = useRef<SpeechState>({ hasSpeech: false, lastVoiceAt: 0, startedAt: 0, stopped: false, discard: false });
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const isLive = !["idle", "listening-wake", "ended"].includes(appState);
 
-  // Refs
-  const roomRef          = useRef<Room | null>(null);
-  const micStreamRef     = useRef<MediaStream | null>(null);
-  const recorderRef      = useRef<MediaRecorder | null>(null);
-  const chunksRef        = useRef<Blob[]>([]);
-  const animRef          = useRef<number | null>(null);
-  const levelAnimRef     = useRef<number | null>(null);
-  const analyserRef      = useRef<AnalyserNode | null>(null);
-  const speechStateRef   = useRef<SpeechState>({ hasSpeech: false, lastVoiceAt: 0, startedAt: 0, stopped: false, discard: false });
-  const responseAudioRef = useRef<HTMLAudioElement | null>(null);
-  const remoteAudioRef   = useRef<HTMLDivElement | null>(null);
-  const chatEndRef       = useRef<HTMLDivElement | null>(null);
-  const isLive           = appState !== "idle" && appState !== "connecting";
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chat]);
 
-  // Scroll chat to bottom
-  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatHistory]);
-
-  // Cleanup on unmount
   useEffect(() => {
-    return () => {
-      stopCurrentRecorder(true);
-      stopLevelMeter();
-      micStreamRef.current?.getTracks().forEach(t => t.stop());
-      roomRef.current?.disconnect();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (["speaking", "speaking-intro", "listening", "awaiting-id"].includes(appState)) {
+      const id = setInterval(() => setTick(t => t + 1), 60);
+      return () => clearInterval(id);
+    }
+  }, [appState]);
+  void tick;
+
+  useEffect(() => () => { cleanup(); }, []);
 
   // ── Level meter ────────────────────────────────────────────
   const startLevelMeter = useCallback((analyser: AnalyserNode) => {
@@ -191,8 +124,7 @@ export function VoiceConsole() {
       analyser.getByteTimeDomainData(data);
       let sum = 0;
       for (const v of data) { const c = (v - 128) / 128; sum += c * c; }
-      const rms = Math.sqrt(sum / data.length);
-      setVoiceLevel(prev => prev * 0.6 + rms * 0.4);
+      setVoiceLevel(p => p * 0.6 + Math.sqrt(sum / data.length) * 0.4);
       levelAnimRef.current = requestAnimationFrame(tick);
     };
     levelAnimRef.current = requestAnimationFrame(tick);
@@ -204,168 +136,101 @@ export function VoiceConsole() {
     setVoiceLevel(0);
   }, []);
 
-  // ── Chat helpers ───────────────────────────────────────────
   function pushChat(entry: ChatEntry) {
-    setChatHistory(prev => [...prev, entry]);
-    if (entry.role === "agent") {
-      setLatestAgentText(entry.text);
-      if (entry.intent) setLatestAgentIntent(entry.intent);
-    }
+    setChat(prev => [...prev, entry]);
+    if (entry.role === "agent") { setLatestText(entry.text); if (entry.intent) setLatestIntent(entry.intent); }
   }
 
-  // ── Save citizen ───────────────────────────────────────────
-  async function saveCitizen() {
-    await createCitizen({
-      phone_number: phoneNumber,
-      full_name: fullName,
-      preferred_language: languageCode.slice(0, 2),
-      district_name: district,
-      phc_name: phcName
-    });
+  async function playAudio(b64: string | null, mime: string) {
+    if (!b64) return;
+    audioRef.current?.pause();
+    const audio = new Audio(`data:${mime};base64,${b64}`);
+    audioRef.current = audio;
+    await new Promise<void>(r => { audio.onended = () => r(); audio.onerror = () => r(); audio.play().catch(() => r()); });
   }
 
-  // ── Text turn ──────────────────────────────────────────────
-  async function submitText(promptText = text) {
-    if (!promptText.trim()) return;
-    setAppState("thinking");
-    setError(null);
-    const result = await postTextTurn({ text: promptText, phone_number: phoneNumber, language_code: languageCode, session_id: sessionId ?? undefined });
-    setTurn(result);
-    pushChat({ role: "user", text: promptText });
-    pushChat({ role: "agent", text: result.response_text, intent: result.intent });
-    setAppState("speaking");
-    await playAudio(result.audio_base64, result.audio_mime_type);
-    setAppState(sessionId ? "listening" : "idle");
+  function cleanup() {
+    if (animRef.current) { cancelAnimationFrame(animRef.current); animRef.current = null; }
+    stopLevelMeter();
+    recorderRef.current?.stop();
+    recorderRef.current = null;
+    audioRef.current?.pause();
+    audioRef.current = null;
+    micStreamRef.current?.getTracks().forEach(t => t.stop());
+    micStreamRef.current = null;
   }
 
   // ── Wake word listener ─────────────────────────────────────
   useEffect(() => {
     if (!mounted || isLive) return;
-    
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) return;
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = false;
-    recognition.lang = "en-IN";
-
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) { setAppState("idle"); return; }
+    setAppState("listening-wake");
+    const rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = false;
+    rec.lang = "en-IN";
     let active = true;
 
-    recognition.onresult = (event: any) => {
+    rec.onresult = (e: any) => {
       if (!active) return;
-      const last = event.results.length - 1;
-      const transcript = event.results[last][0].transcript.toLowerCase();
-      
-      let detectedLang = "";
-      if (transcript.includes("vanakkam") || transcript.includes("one come") || transcript.includes("welcome")) {
-         detectedLang = "ta-IN";
-      } else if (transcript.includes("namaste") || transcript.includes("namaskar") || transcript.includes("नमस्ते")) {
-         detectedLang = "hi-IN";
-      } else if (transcript.includes("namaskara") || transcript.includes("ನಮಸ್ಕಾರ")) {
-         detectedLang = "kn-IN";
-      } else if (transcript.match(/\b(hi|hello|hey)\b/)) {
-         detectedLang = "en-IN";
-      }
-
-      if (detectedLang) {
-        active = false;
-        recognition.stop();
-        runSafely(() => startRealtime(detectedLang));
-      }
+      const t = e.results[e.results.length - 1][0].transcript;
+      const lang = detectWakeWord(t);
+      if (lang) { active = false; rec.stop(); runSafely(() => beginSession(lang)); }
     };
-
-    recognition.onend = () => {
-      if (active && !isLive) {
-        try { recognition.start(); } catch (e) {}
-      }
-    };
-
-    try { recognition.start(); } catch (e) {}
-
-    return () => {
-      active = false;
-      try { recognition.stop(); } catch (e) {}
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    rec.onend = () => { if (active && !isLive) { try { rec.start(); } catch {} } };
+    try { rec.start(); } catch {}
+    return () => { active = false; try { rec.stop(); } catch {} setAppState("idle"); };
   }, [mounted, isLive]);
 
-  // ── Start / stop realtime ──────────────────────────────────
-  async function startRealtime(langOverride?: string) {
+  // ── Start session ─────────────────────────────────────────
+  async function beginSession(lang: string) {
     setError(null);
-    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-      setError("Microphone access unavailable. Open via http://localhost:3001 or HTTPS.");
-      return;
-    }
-
+    setChat([]);
+    setSummary(null);
+    setCitizen(null);
+    setVerificationState("pending");
+    setLatestText("");
+    setLatestIntent("");
     setAppState("connecting");
 
-    const effectiveLang = langOverride || languageCode;
-    if (langOverride && langOverride !== languageCode) {
-      setLanguageCode(langOverride);
-    }
-
-    const session = await startSession({ phone_number: phoneNumber, language_code: effectiveLang });
+    const session = await startSession({ language_code: lang });
     setSessionId(session.session_id);
-    pushChat({ role: "agent", text: session.intro_text });
+    pushChat({ role: "agent", text: session.intro_text, intent: "verify_identity", timestamp: Date.now() });
 
-    // LiveKit
-    const nextRoom    = `citizen-health-${Date.now()}`;
-    const participant = phoneNumber || `citizen-${Date.now()}`;
-    const token = await createLiveKitToken(nextRoom, participant, { phone_number: phoneNumber, language_code: languageCode, full_name: fullName });
-    const room = new Room({ adaptiveStream: true, dynacast: true });
-    roomRef.current = room;
-
-    room
-      .on(RoomEvent.Disconnected, () => { setAppState("idle"); stopLevelMeter(); })
-      .on(RoomEvent.TrackSubscribed, (track) => {
-        if (track.kind === Track.Kind.Audio && remoteAudioRef.current) {
-          remoteAudioRef.current.appendChild(track.attach());
-        }
-      });
-
-    await room.connect(token.url, token.token);
-
-    // Intro audio
     setAppState("speaking-intro");
     await playAudio(session.audio_base64, session.audio_mime_type);
 
-    // Open mic
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
     micStreamRef.current = stream;
-    const [audioTrack] = stream.getAudioTracks();
-    await room.localParticipant.publishTrack(audioTrack, { name: "citizen-microphone", source: Track.Source.Microphone });
-
-    setAppState("listening");
-    startAutoTurnRecorder(stream, session.session_id);
+    setAppState("awaiting-id");
+    startVADRecorder(stream, session.session_id);
   }
 
-  async function stopRealtime() {
-    stopCurrentRecorder(true);
-    stopLevelMeter();
-    responseAudioRef.current?.pause();
-    responseAudioRef.current = null;
-    micStreamRef.current?.getTracks().forEach(t => t.stop());
-    micStreamRef.current = null;
-    await roomRef.current?.disconnect();
-    roomRef.current = null;
+  // ── End session ───────────────────────────────────────────
+  async function endSession() {
+    const sid = sessionId;
+    cleanup();
+    setAppState("ended");
+    if (sid) {
+      try {
+        const s = await fetchSessionSummary(sid);
+        setSummary(s);
+      } catch {}
+    }
     setSessionId(null);
-    setChatHistory([]);
-    setLatestAgentText("");
-    setLatestAgentIntent("");
-    setTurn(null);
-    setAppState("idle");
   }
 
   // ── VAD recorder ──────────────────────────────────────────
-  function startAutoTurnRecorder(stream: MediaStream, sid: string) {
-    if (!roomRef.current) return;
-    stopCurrentRecorder();
+  function startVADRecorder(stream: MediaStream, sid: string) {
+    if (recorderRef.current) { recorderRef.current.stop(); recorderRef.current = null; }
     chunksRef.current = [];
     speechStateRef.current = { hasSpeech: false, lastVoiceAt: 0, startedAt: performance.now(), stopped: false, discard: false };
 
-    const mimeType = getSupportedMimeType();
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+    const mime = getSupportedMimeType();
+    const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
     recorderRef.current = recorder;
 
     const audioCtx = new AudioContext();
@@ -373,23 +238,19 @@ export function VoiceConsole() {
     audioCtx.createMediaStreamSource(stream).connect(analyser);
     startLevelMeter(analyser);
 
-    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
     recorder.onstop = async () => {
-      cancelAnimFrames();
+      if (animRef.current) { cancelAnimationFrame(animRef.current); animRef.current = null; }
       stopLevelMeter();
       await audioCtx.close();
-
       const state = speechStateRef.current;
-      const blob  = new Blob(chunksRef.current, { type: "audio/webm" });
+      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
       chunksRef.current = [];
-
-      if (state.discard || !roomRef.current || !state.hasSpeech || blob.size < 900) {
-        if (roomRef.current) window.setTimeout(() => startAutoTurnRecorder(stream, sid), 150);
+      if (state.discard || !state.hasSpeech || blob.size < 900 || !micStreamRef.current) {
+        if (micStreamRef.current) setTimeout(() => startVADRecorder(stream, sid), 150);
         return;
       }
-      await sendVoiceTurn(blob, sid);
-      if (roomRef.current) window.setTimeout(() => startAutoTurnRecorder(stream, sid), 150);
+      await handleVoiceTurn(blob, sid, stream);
     };
 
     recorder.start(200);
@@ -399,335 +260,250 @@ export function VoiceConsole() {
   function monitorSpeech(analyser: AnalyserNode, stream: MediaStream, sid: string) {
     const data = new Uint8Array(analyser.fftSize);
     const tick = () => {
-      const recorder = recorderRef.current;
-      const state    = speechStateRef.current;
-      if (!recorder || recorder.state !== "recording" || state.stopped) return;
-
+      const r = recorderRef.current;
+      const s = speechStateRef.current;
+      if (!r || r.state !== "recording" || s.stopped) return;
       analyser.getByteTimeDomainData(data);
       let sum = 0;
       for (const v of data) { const c = (v - 128) / 128; sum += c * c; }
       const rms = Math.sqrt(sum / data.length);
       const now = performance.now();
-
       if (rms > VOICE_THRESHOLD) {
-        if (!state.hasSpeech) state.startedAt = now;
-        state.hasSpeech  = true;
-        state.lastVoiceAt = now;
-        setAppState("listening");
+        if (!s.hasSpeech) s.startedAt = now;
+        s.hasSpeech = true; s.lastVoiceAt = now;
+        setAppState(prev => prev === "awaiting-id" ? "awaiting-id" : "listening");
       }
-
-      const speechDur  = now - state.startedAt;
-      const silenceDur = now - state.lastVoiceAt;
-      const close =
-        (state.hasSpeech && speechDur > MIN_SPEECH_MS && silenceDur > SILENCE_MS) ||
-        (state.hasSpeech && speechDur > MAX_TURN_MS) ||
-        (!state.hasSpeech && speechDur > NO_SPEECH_ROLLOVER_MS);
-
-      if (close) { state.stopped = true; recorder.stop(); return; }
-      animRef.current = window.requestAnimationFrame(tick);
+      const dur = now - s.startedAt;
+      const sil = now - s.lastVoiceAt;
+      if ((s.hasSpeech && dur > MIN_SPEECH_MS && sil > SILENCE_MS) || (s.hasSpeech && dur > MAX_TURN_MS) || (!s.hasSpeech && dur > NO_SPEECH_ROLLOVER_MS)) {
+        s.stopped = true; r.stop(); return;
+      }
+      animRef.current = requestAnimationFrame(tick);
     };
-    animRef.current = window.requestAnimationFrame(tick);
-    void stream; void sid; // used by onstop closure
+    animRef.current = requestAnimationFrame(tick);
   }
 
-  async function sendVoiceTurn(blob: Blob, sid: string) {
+  async function handleVoiceTurn(blob: Blob, sid: string, stream: MediaStream) {
     setAppState("thinking");
     try {
-      const result = await postVoiceTurn(blob, phoneNumber, sid);
-      setTurn(result);
+      const result = await postVoiceTurn(blob, undefined, sid);
 
-      // Auto-update UI language based on STT detection
-      if (result.language_code && result.language_code !== languageCode) {
-        setLanguageCode(result.language_code);
+      // Handle verification result
+      if (result.intent === "verify_identity" || result.intent === "verification_failed") {
+        const verAction = result.actions.find((a: any) => a.type === "citizen_verified");
+        const guestAction = result.actions.find((a: any) => a.type === "guest_mode");
+        if (verAction) {
+          setVerificationState("verified");
+          setCitizen({ full_name: verAction.citizen_name as string, phc_name: verAction.phc as string, ayushman_eligible: verAction.ayushman_eligible as boolean });
+        } else if (guestAction) {
+          setVerificationState("guest");
+        }
       }
 
-      if (result.transcript) pushChat({ role: "user", text: result.transcript });
-      pushChat({ role: "agent", text: result.response_text, intent: result.intent });
+      if (result.transcript) pushChat({ role: "user", text: result.transcript, timestamp: Date.now() });
+      pushChat({ role: "agent", text: result.response_text, intent: result.intent, timestamp: Date.now() });
+
+      if (result.intent === "session_end") {
+        setAppState("speaking");
+        await playAudio(result.audio_base64, result.audio_mime_type);
+        await endSession();
+        return;
+      }
+
       setAppState("speaking");
       await playAudio(result.audio_base64, result.audio_mime_type);
+
+      // Next state after speaking
+      const nextState = verificationState === "pending" && result.intent === "verify_identity" && !result.actions.find((a:any) => a.type === "citizen_verified") ? "awaiting-id" : "listening";
+      setAppState(nextState);
+      if (micStreamRef.current) setTimeout(() => startVADRecorder(stream, sid), 150);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Voice turn failed");
-    } finally {
-      if (roomRef.current) setAppState("listening");
+      setError(err instanceof Error ? err.message : "Turn failed");
+      setAppState(micStreamRef.current ? "listening" : "idle");
+      if (micStreamRef.current) setTimeout(() => startVADRecorder(stream, sid), 150);
     }
-  }
-
-  // ── Audio playback ─────────────────────────────────────────
-  async function playAudio(base64: string | null, mime: string) {
-    if (!base64) return;
-    responseAudioRef.current?.pause();
-    const audio = new Audio(`data:${mime};base64,${base64}`);
-    responseAudioRef.current = audio;
-    await new Promise<void>(resolve => {
-      audio.onended = () => resolve();
-      audio.onerror = () => resolve();
-      audio.play().catch(() => resolve());
-    });
-  }
-
-  // ── Recorder helpers ───────────────────────────────────────
-  function stopCurrentRecorder(discard = false) {
-    cancelAnimFrames();
-    const r = recorderRef.current;
-    recorderRef.current = null;
-    if (r?.state === "recording") {
-      speechStateRef.current.stopped = true;
-      speechStateRef.current.discard = discard;
-      r.stop();
-    }
-  }
-
-  function cancelAnimFrames() {
-    if (animRef.current)      { window.cancelAnimationFrame(animRef.current);      animRef.current = null; }
-    if (levelAnimRef.current) { cancelAnimationFrame(levelAnimRef.current); levelAnimRef.current = null; }
   }
 
   async function runSafely(fn: () => Promise<void>) {
     try { await fn(); }
-    catch (err) { setError(err instanceof Error ? err.message : "Request failed"); setAppState("idle"); }
+    catch (err) { setError(err instanceof Error ? err.message : "Failed"); setAppState("idle"); }
   }
 
-  // ── Orb visuals ────────────────────────────────────────────
-  const orb = orbConfig(appState, voiceLevel);
+  if (!mounted) return <div className="va-shell" />;
 
-  const micUnavailable =
-    typeof window !== "undefined" &&
-    window.location.protocol === "http:" &&
-    window.location.hostname !== "localhost" &&
-    window.location.hostname !== "127.0.0.1";
-
-  // Wave bars driven by voiceLevel when agent speaks
-  const waveBars = Array.from({ length: 7 }, (_, i) => {
-    const isSpeaking = appState === "speaking" || appState === "speaking-intro";
-    const h = isSpeaking
-      ? 4 + Math.abs(Math.sin((Date.now() / 200) + i * 0.8)) * 20
-      : appState === "listening"
-        ? 4 + voiceLevel * 120 * Math.abs(Math.sin(i * 1.2))
-        : 4;
+  const orb = orbStyle(appState, voiceLevel);
+  const waveBars = Array.from({ length: 9 }, (_, i) => {
+    const speaking = appState === "speaking" || appState === "speaking-intro";
+    const listening = appState === "listening" || appState === "awaiting-id";
+    const h = speaking ? 4 + Math.abs(Math.sin(Date.now() / 180 + i * 0.9)) * 28
+            : listening ? 4 + voiceLevel * 140 * Math.abs(Math.sin(i * 1.3))
+            : 4;
     return h;
   });
 
-  // Force re-render while speaking/listening to animate waveform
-  const [tick, setTick] = useState(0);
-  useEffect(() => {
-    if (appState === "speaking" || appState === "speaking-intro" || appState === "listening") {
-      const id = window.setInterval(() => setTick(t => t + 1), 60);
-      return () => window.clearInterval(id);
-    }
-  }, [appState]);
-  void tick;
-
-  const latestVisible = latestAgentText.length > 0;
-
-  if (!mounted) {
-    return <div className="gl-shell" />;
-  }
-
   return (
-    <div className="gl-shell">
-      {/* Insecure origin banner */}
-      {micUnavailable && (
-        <div className="gl-insecure">
-          Mic requires secure origin — open at <strong>http://localhost:3001</strong> or via HTTPS.
-        </div>
-      )}
-
+    <div className="va-shell">
       {/* Top bar */}
-      <header className="gl-topbar">
-        <div className="gl-wordmark">
-          <div className="gl-wordmark-dot" />
-          <h1>Citizen Health AI</h1>
+      <header className="va-topbar">
+        <div className="va-brand">
+          <div className="va-brand-dot" />
+          <span>Aarogya</span>
+          <span className="va-brand-sub">Citizen Health AI</span>
         </div>
-        <div className="gl-topbar-actions">
-          {/* Navigation links to additional pages */}
-          <Link href="/analytics" className="gl-nav-link" style={{ fontSize: "0.75rem" }}>
-            <BarChart3 size={13} /> Analytics
-          </Link>
-          <Link href="/debug" className="gl-nav-link" style={{ fontSize: "0.75rem" }}>
-            <Brain size={13} /> LLM Probe
-          </Link>
-          {chatHistory.length > 0 && (
-            <button className="gl-icon-btn" aria-label="History" onClick={() => setShowChat(v => !v)}>
-              <MessageSquare size={18} />
-            </button>
+        <div className="va-topbar-right">
+          {citizen && verificationState === "verified" && (
+            <div className="va-citizen-badge">
+              <User size={13} />
+              <span>{citizen.full_name}</span>
+              {citizen.ayushman_eligible && <span className="va-ayush-dot" title="Ayushman eligible" />}
+            </div>
           )}
-          <button className="gl-icon-btn" aria-label="Settings" onClick={() => setShowSettings(v => !v)}>
-            <Settings size={18} />
-          </button>
+          <Link href="/analytics" className="va-nav-pill"><BarChart3 size={13} /> Analytics</Link>
+          <Link href="/debug" className="va-nav-pill"><Brain size={13} /> LLM Probe</Link>
         </div>
       </header>
 
-      {/* Center stage */}
-      <main className="gl-stage">
+      {/* Main stage */}
+      <main className="va-stage">
         {/* Ambient glow */}
-        <div className="gl-ambient" style={{ background: orb.ambient }} />
+        <div className="va-ambient" style={{ background: orb.glow }} />
 
         {/* Orb */}
-        <div className="gl-orb-wrapper">
+        <div className="va-orb-wrap">
           <div
-            className="gl-orb"
+            className="va-orb"
             role="button"
-            aria-label={isLive ? "End session" : "Start session"}
-            onClick={() => runSafely(isLive ? stopRealtime : startRealtime)}
-            style={{ transform: `scale(${orb.scale})` }}
+            aria-label={isLive ? "End call" : "Waiting for wake word"}
+            onClick={() => isLive && runSafely(endSession)}
+            style={{ transform: `scale(${orb.scale})`, cursor: isLive ? "pointer" : "default" }}
           >
-            <div className="gl-orb-core" style={{ background: orb.bg }} />
-            <div className="gl-orb-shine" />
-            <div className="gl-orb-ring" style={{ borderColor: orb.ring }} />
-            <div className="gl-halo" style={{ borderColor: orb.haloBorder }} />
-
-            {/* Center icon */}
-            <div className="gl-orb-icon">
-              {appState === "connecting" || appState === "thinking" ? (
-                <Loader2 size={40} color="rgba(255,255,255,0.6)" className="spin" />
-              ) : isLive ? (
-                <PhoneOff size={34} color="rgba(255,255,255,0.5)" />
-              ) : (
-                <Mic size={40} color="rgba(255,255,255,0.7)" />
-              )}
+            <div className="va-orb-core" style={{ background: orb.grad }} />
+            <div className="va-orb-shine" />
+            <div className="va-orb-ring" style={{ borderColor: orb.ring }} />
+            <div className="va-orb-halo" />
+            <div className="va-orb-icon">
+              {appState === "connecting" || appState === "thinking" || appState === "verifying"
+                ? <Loader2 size={44} color="rgba(255,255,255,0.55)" className="spin" />
+                : isLive
+                  ? <PhoneOff size={36} color="rgba(255,255,255,0.45)" />
+                  : <Mic size={44} color="rgba(255,255,255,0.6)" />
+              }
             </div>
           </div>
 
-          {/* Status label */}
-          <div className="gl-status-label">
-            <div className="gl-status-dot" style={{ background: orb.dotColor }} />
-            {orb.label}
-          </div>
-
-          {/* Waveform */}
-          <div className="gl-wave">
+          {/* Wave bars */}
+          <div className="va-wave">
             {waveBars.map((h, i) => (
-              <div key={i} className="gl-wave-bar" style={{ height: `${h}px`, opacity: isLive ? 0.7 : 0.2 }} />
+              <div key={i} className="va-wave-bar" style={{ height: `${h}px`, opacity: isLive ? 0.75 : 0.18, background: orb.glow }} />
             ))}
           </div>
-        </div>
 
-        {/* Latest agent transcript */}
-        <div className="gl-transcript">
-          <div className={`gl-transcript-text ${latestVisible ? "visible" : ""}`}>
-            {latestAgentIntent && (
-              <span className="gl-transcript-intent">{latestAgentIntent.replace(/_/g, " ")}</span>
-            )}
-            {latestAgentText}
+          {/* Status */}
+          <div className="va-status">
+            <div className="va-status-dot" style={{ background: orb.glow }} />
+            {orb.label}
           </div>
         </div>
 
-        {error && <div className="gl-error">{error}</div>}
+        {/* Latest agent text */}
+        {latestText && (
+          <div className="va-latest">
+            {latestIntent && (
+              <div className="va-intent-tag">
+                {(() => { const Icon = INTENT_ICONS[latestIntent]; return Icon ? <Icon size={11} /> : null; })()}
+                {latestIntent.replace(/_/g, " ")}
+              </div>
+            )}
+            <p>{latestText}</p>
+          </div>
+        )}
+
+        {error && (
+          <div className="va-error">
+            <AlertTriangle size={14} /> {error}
+          </div>
+        )}
+
+        {/* Wake word hint */}
+        {appState === "listening-wake" && (
+          <div className="va-wake-hint">
+            <div className="va-wake-langs">
+              <span>Say:</span>
+              <span className="va-wake-word">Hello</span>
+              <span className="va-wake-sep">·</span>
+              <span className="va-wake-word">Namaste</span>
+              <span className="va-wake-sep">·</span>
+              <span className="va-wake-word">Namaskara</span>
+              <span className="va-wake-sep">·</span>
+              <span className="va-wake-word">Vanakkam</span>
+            </div>
+          </div>
+        )}
       </main>
 
-      {/* Bottom toolbar */}
-      <footer className="gl-bottom">
-        {/* Quick chips — hidden while live */}
-        {!isLive && (
-          <div className="gl-chips">
-            {quickPrompts.map(p => {
-              const Icon = p.icon;
-              return (
-                <button key={p.label} className="gl-chip" onClick={() => { setText(p.text); runSafely(() => submitText(p.text)); }}>
-                  <Icon size={14} />
-                  {p.label}
-                </button>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Text input */}
-        <div className="gl-text-row">
-          <input
-            className="gl-text-input"
-            placeholder="Type a message…"
-            value={text}
-            onChange={e => setText(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter") runSafely(() => submitText()); }}
-          />
-          <button
-            className="gl-send-btn"
-            disabled={!text.trim() || appState === "thinking" || appState === "connecting"}
-            onClick={() => runSafely(() => submitText())}
-            aria-label="Send"
-          >
-            {appState === "thinking" ? <Loader2 size={16} className="spin" /> : <Send size={16} />}
-          </button>
-        </div>
-
-        {/* End call button while live */}
-        {isLive && (
-          <button className="gl-end-btn" onClick={() => runSafely(stopRealtime)}>
-            <PhoneOff size={18} /> End session
-          </button>
-        )}
-      </footer>
-
-      {/* Hidden LiveKit remote audio container */}
-      <div ref={remoteAudioRef} style={{ display: "none" }} />
-
-      {/* ── Settings drawer ───────────────────────────────── */}
-      <div className={`gl-settings-overlay ${showSettings ? "open" : ""}`} onClick={e => { if (e.target === e.currentTarget) setShowSettings(false); }}>
-        <div className="gl-settings-drawer">
-          <div className="gl-settings-title">
-            <span>Settings</span>
-            <button className="gl-icon-btn" onClick={() => setShowSettings(false)}><X size={16} /></button>
-          </div>
-          <label>
-            Phone
-            <input value={phoneNumber} onChange={e => setPhoneNumber(e.target.value)} />
-          </label>
-          <label>
-            Name
-            <input value={fullName} onChange={e => setFullName(e.target.value)} />
-          </label>
-          <label>
-            Language
-            <select value={languageCode} onChange={e => setLanguageCode(e.target.value)}>
-              <option value="en-IN">English</option>
-              <option value="hi-IN">Hindi / Hinglish</option>
-              <option value="ta-IN">Tamil</option>
-              <option value="kn-IN">Kannada</option>
-            </select>
-          </label>
-          <label>
-            District
-            <input value={district} onChange={e => setDistrict(e.target.value)} />
-          </label>
-          <label>
-            PHC
-            <input value={phcName} onChange={e => setPhcName(e.target.value)} />
-          </label>
-          <button className="gl-save-btn" onClick={() => runSafely(saveCitizen)}>
-            <ShieldCheck size={17} /> Save citizen
-          </button>
-          {turn && (
-            <>
-              <hr style={{ borderColor: "var(--line)", margin: "4px 0" }} />
-              <small style={{ color: "var(--muted)", fontSize: "0.75rem" }}>
-                Session: {sessionId ? sessionId.slice(0, 8) + "…" : "None"}<br />
-                Intent: {turn.intent}<br />
-                DB: {turn.db_configured ? "Supabase" : "demo"}
-              </small>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* ── Chat history panel ────────────────────────────── */}
-      <div className={`gl-chat-panel ${showChat ? "open" : ""}`}>
-        <div className="gl-chat-header">
-          <span>Conversation</span>
-          <button className="gl-icon-btn" onClick={() => setShowChat(false)}><X size={16} /></button>
-        </div>
-        <div className="gl-chat-messages">
-          {chatHistory.map((entry, i) => (
-            <div key={i} className={`gl-msg gl-msg--${entry.role}`}>
-              {entry.intent && entry.role === "agent" && (
-                <span className="gl-msg-intent">{entry.intent.replace(/_/g, " ")}</span>
+      {/* Chat history */}
+      {chat.length > 0 && (
+        <div className="va-chat-rail">
+          {chat.slice(-6).map((e, i) => (
+            <div key={i} className={`va-msg va-msg--${e.role}`}>
+              {e.role === "agent" && e.intent && (
+                <span className="va-msg-intent">{e.intent.replace(/_/g, " ")}</span>
               )}
-              <div className="gl-msg-bubble">{entry.text}</div>
+              <div className="va-msg-bubble">{e.text}</div>
             </div>
           ))}
           <div ref={chatEndRef} />
         </div>
-      </div>
+      )}
+
+      {/* End call button */}
+      {isLive && (
+        <footer className="va-footer">
+          <button className="va-end-btn" onClick={() => runSafely(endSession)}>
+            <PhoneOff size={18} /> End Call
+          </button>
+        </footer>
+      )}
+
+      {/* Post-call summary */}
+      {appState === "ended" && summary && (
+        <div className="va-summary-overlay">
+          <div className="va-summary-card">
+            <div className="va-summary-header">
+              <CheckCircle2 size={22} color="#6ee7b7" />
+              <h2>Call Summary</h2>
+              <button className="va-summary-close" onClick={() => { setSummary(null); setAppState("idle"); }}><X size={16} /></button>
+            </div>
+
+            {summary.citizen && (
+              <div className="va-summary-citizen">
+                <User size={16} />
+                <div>
+                  <div className="va-summary-name">{(summary.citizen as any).full_name || "Guest"}</div>
+                  <div className="va-summary-phc">{(summary.citizen as any).phc_name || ""}</div>
+                </div>
+                <div className="va-summary-badge" style={{ color: summary.verification_state === "verified" ? "#6ee7b7" : "#fbbf24" }}>
+                  {summary.verification_state === "verified" ? "✓ Verified" : "Guest"}
+                </div>
+              </div>
+            )}
+
+            <div className="va-summary-stats">
+              <div className="va-stat"><span>{summary.turns}</span><label>Turns</label></div>
+              <div className="va-stat"><span>{summary.language_code?.split("-")[0].toUpperCase()}</span><label>Language</label></div>
+              <div className="va-stat"><span>{summary.history_length}</span><label>Messages</label></div>
+            </div>
+
+            {summary.call_summary && (
+              <p className="va-summary-text">{summary.call_summary}</p>
+            )}
+
+            <button className="va-summary-new-btn" onClick={() => { setSummary(null); setAppState("idle"); setChat([]); setLatestText(""); }}>
+              Start New Call
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
