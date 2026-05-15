@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   BarChart3, Brain, PhoneOff, Mic, Loader2, X,
-  CheckCircle2, AlertTriangle, User, Calendar, Shield, Navigation, Radio,
+  CheckCircle2, AlertTriangle, User, Calendar, Shield, Navigation, Radio, Stethoscope,
 } from "lucide-react";
 import { Room, RoomEvent, Track, ConnectionState } from "livekit-client";
 import {
@@ -450,6 +450,8 @@ export function VoiceConsole() {
               {citizen.ayushman_eligible && <span className="va-ayush-dot" title="Ayushman eligible" />}
             </div>
           )}
+          <Link href="/health-worker" className="va-nav-pill"><Stethoscope size={13} /> Health Worker</Link>
+          <Link href="/surveillance" className="va-nav-pill"><Radio size={13} /> Surveillance</Link>
           <Link href="/analytics" className="va-nav-pill"><BarChart3 size={13} /> Analytics</Link>
           <Link href="/debug" className="va-nav-pill"><Brain size={13} /> LLM Probe</Link>
         </div>
