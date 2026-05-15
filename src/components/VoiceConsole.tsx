@@ -1,8 +1,15 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { BarChart3, Brain, PhoneOff, Mic, Loader2, X, CheckCircle2, AlertTriangle, User, Calendar, Shield, Navigation } from "lucide-react";
-import { TurnResponse, SessionSummary, startSession, postVoiceTurn, fetchSessionSummary } from "@/lib/api";
+import {
+  BarChart3, Brain, PhoneOff, Mic, Loader2, X,
+  CheckCircle2, AlertTriangle, User, Calendar, Shield, Navigation, Radio,
+} from "lucide-react";
+import { Room, RoomEvent, Track, ConnectionState } from "livekit-client";
+import {
+  TurnResponse, SessionSummary,
+  startSession, postVoiceTurn, fetchSessionSummary, createLiveKitToken,
+} from "@/lib/api";
 
 // ── Constants ──────────────────────────────────────────────
 const SILENCE_MS = 700;
@@ -11,17 +18,20 @@ const MAX_TURN_MS = 15000;
 const NO_SPEECH_ROLLOVER_MS = 25000;
 const VOICE_THRESHOLD = 0.02;
 
-type AppState = "idle" | "listening-wake" | "connecting" | "speaking-intro" | "awaiting-id" | "verifying" | "listening" | "thinking" | "speaking" | "ended";
+type AppState =
+  | "idle" | "listening-wake" | "connecting" | "speaking-intro"
+  | "awaiting-id" | "verifying" | "listening" | "thinking" | "speaking" | "ended";
 
-type SpeechState = { hasSpeech: boolean; lastVoiceAt: number; startedAt: number; stopped: boolean; discard: boolean };
+type SpeechState = {
+  hasSpeech: boolean; lastVoiceAt: number;
+  startedAt: number; stopped: boolean; discard: boolean;
+};
 
 type ChatEntry = { role: "agent" | "user"; text: string; intent?: string; timestamp: number };
 
-type CitizenInfo = {
-  full_name?: string;
-  phc_name?: string;
-  ayushman_eligible?: boolean;
-};
+type CitizenInfo = { full_name?: string; phc_name?: string; ayushman_eligible?: boolean };
+
+type LKStatus = "disconnected" | "connecting" | "connected" | "failed";
 
 function getSupportedMimeType() {
   for (const t of ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"]) {
@@ -30,7 +40,6 @@ function getSupportedMimeType() {
   return "";
 }
 
-// Wake words across languages
 const WAKE_WORDS = [
   { words: ["vanakkam", "one come", "வணக்கம்"], lang: "ta-IN" },
   { words: ["namaskara", "ನಮಸ್ಕಾರ", "namaskaar"], lang: "kn-IN" },
@@ -75,6 +84,13 @@ const INTENT_ICONS: Record<string, typeof CheckCircle2> = {
   session_end: CheckCircle2,
 };
 
+const LK_STATUS_COLORS: Record<LKStatus, string> = {
+  disconnected: "#6a7c76",
+  connecting: "#f4c154",
+  connected: "#3ddc97",
+  failed: "#ff6b4a",
+};
+
 export function VoiceConsole() {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
@@ -90,8 +106,9 @@ export function VoiceConsole() {
   const [verificationState, setVerificationState] = useState<"pending" | "verified" | "guest">("pending");
   const [summary, setSummary] = useState<SessionSummary | null>(null);
   const [tick, setTick] = useState(0);
+  const [lkStatus, setLkStatus] = useState<LKStatus>("disconnected");
+  const [lkRoom, setLkRoom] = useState<string | null>(null);
 
-  const roomRef = useRef<any>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -101,6 +118,7 @@ export function VoiceConsole() {
   const speechStateRef = useRef<SpeechState>({ hasSpeech: false, lastVoiceAt: 0, startedAt: 0, stopped: false, discard: false });
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const lkRoomRef = useRef<Room | null>(null);
   const isLive = !["idle", "listening-wake", "ended"].includes(appState);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chat]);
@@ -158,6 +176,59 @@ export function VoiceConsole() {
     audioRef.current = null;
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
+    if (lkRoomRef.current) {
+      lkRoomRef.current.disconnect().catch(() => {});
+      lkRoomRef.current = null;
+    }
+    setLkStatus("disconnected");
+    setLkRoom(null);
+  }
+
+  // ── LiveKit room setup ─────────────────────────────────────
+  async function connectLiveKit(roomName: string, participantName: string): Promise<MediaStream | null> {
+    setLkStatus("connecting");
+    try {
+      const { token, url } = await createLiveKitToken(roomName, participantName);
+
+      const room = new Room({
+        audioCaptureDefaults: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        adaptiveStream: true,
+        dynacast: true,
+      });
+
+      lkRoomRef.current = room;
+
+      room.on(RoomEvent.Disconnected, () => {
+        setLkStatus("disconnected");
+        setLkRoom(null);
+      });
+      room.on(RoomEvent.ConnectionStateChanged, (state: ConnectionState) => {
+        if (state === ConnectionState.Connected) setLkStatus("connected");
+        else if (state === ConnectionState.Connecting) setLkStatus("connecting");
+        else if (state === ConnectionState.Disconnected) { setLkStatus("disconnected"); setLkRoom(null); }
+      });
+      room.on(RoomEvent.Reconnecting, () => setLkStatus("connecting"));
+      room.on(RoomEvent.Reconnected, () => setLkStatus("connected"));
+
+      await room.connect(url, token);
+      await room.localParticipant.setMicrophoneEnabled(true);
+
+      const pub = room.localParticipant.getTrackPublication(Track.Source.Microphone);
+      const mst = pub?.audioTrack?.mediaStreamTrack;
+
+      setLkStatus("connected");
+      setLkRoom(roomName);
+
+      return mst ? new MediaStream([mst]) : null;
+    } catch (err) {
+      console.warn("[LiveKit] Connection failed:", err);
+      setLkStatus("failed");
+      return null;
+    }
   }
 
   // ── Wake word listener ─────────────────────────────────────
@@ -201,9 +272,17 @@ export function VoiceConsole() {
     setAppState("speaking-intro");
     await playAudio(session.audio_base64, session.audio_mime_type);
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
+    // Connect to LiveKit room, fall back to direct mic if unavailable
+    const roomName = `aarogya-${session.session_id.slice(0, 8)}`;
+    const participantName = `user-${Math.random().toString(36).slice(2, 8)}`;
+    let stream = await connectLiveKit(roomName, participantName);
+
+    if (!stream) {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    }
+
     micStreamRef.current = stream;
     setAppState("awaiting-id");
     startVADRecorder(stream, session.session_id);
@@ -288,7 +367,6 @@ export function VoiceConsole() {
     try {
       const result = await postVoiceTurn(blob, undefined, sid);
 
-      // Handle verification result
       if (result.intent === "verify_identity" || result.intent === "verification_failed") {
         const verAction = result.actions.find((a: any) => a.type === "citizen_verified");
         const guestAction = result.actions.find((a: any) => a.type === "guest_mode");
@@ -313,8 +391,7 @@ export function VoiceConsole() {
       setAppState("speaking");
       await playAudio(result.audio_base64, result.audio_mime_type);
 
-      // Next state after speaking
-      const nextState = verificationState === "pending" && result.intent === "verify_identity" && !result.actions.find((a:any) => a.type === "citizen_verified") ? "awaiting-id" : "listening";
+      const nextState = verificationState === "pending" && result.intent === "verify_identity" && !result.actions.find((a: any) => a.type === "citizen_verified") ? "awaiting-id" : "listening";
       setAppState(nextState);
       if (micStreamRef.current) setTimeout(() => startVADRecorder(stream, sid), 150);
     } catch (err) {
@@ -351,6 +428,21 @@ export function VoiceConsole() {
           <span className="va-brand-sub">Citizen Health AI</span>
         </div>
         <div className="va-topbar-right">
+          {/* LiveKit status badge */}
+          <div
+            className="va-lk-badge"
+            title={lkRoom ? `LiveKit room: ${lkRoom}` : `LiveKit: ${lkStatus}`}
+            style={{ borderColor: `${LK_STATUS_COLORS[lkStatus]}40`, color: LK_STATUS_COLORS[lkStatus] }}
+          >
+            <Radio size={11} />
+            <span>
+              {lkStatus === "connected" ? "LiveKit" : lkStatus === "connecting" ? "Connecting…" : lkStatus === "failed" ? "LK Failed" : "LiveKit"}
+            </span>
+            <span
+              className="va-lk-dot"
+              style={{ background: LK_STATUS_COLORS[lkStatus], boxShadow: lkStatus === "connected" ? `0 0 6px ${LK_STATUS_COLORS[lkStatus]}` : "none" }}
+            />
+          </div>
           {citizen && verificationState === "verified" && (
             <div className="va-citizen-badge">
               <User size={13} />
@@ -365,10 +457,8 @@ export function VoiceConsole() {
 
       {/* Main stage */}
       <main className="va-stage">
-        {/* Ambient glow */}
         <div className="va-ambient" style={{ background: orb.glow }} />
 
-        {/* Orb */}
         <div className="va-orb-wrap">
           <div
             className="va-orb"
@@ -424,7 +514,14 @@ export function VoiceConsole() {
           </div>
         )}
 
-        {/* Wake word hint */}
+        {/* LiveKit room info when connected */}
+        {lkStatus === "connected" && lkRoom && (
+          <div className="va-lk-room-info">
+            <Radio size={11} />
+            <span>Room: <strong>{lkRoom}</strong></span>
+          </div>
+        )}
+
         {appState === "listening-wake" && (
           <div className="va-wake-hint">
             <div className="va-wake-langs">
